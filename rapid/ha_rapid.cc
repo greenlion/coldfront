@@ -233,6 +233,7 @@ int ha_rapid::load_table(const TABLE &table_arg,
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
              "Could not connect to DuckDB database");    
   }
+  std::string create_table_query = "";
   
   for (Field **field = table_arg.s->field; *field; field++) {
     bool is_unsigned = (*field)->all_flags() & UNSIGNED_FLAG;
