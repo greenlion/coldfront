@@ -234,7 +234,7 @@ int ha_rapid::load_table(const TABLE &table_arg,
              "Could not connect to DuckDB database");    
   }
   std::string create_table_query = "";
-  
+
   for (Field **field = table_arg.s->field; *field; field++) {
     bool is_unsigned = (*field)->all_flags() & UNSIGNED_FLAG;
     bool is_nullable = (*field)->is_nullable();
@@ -359,109 +359,82 @@ int ha_rapid::load_table(const TABLE &table_arg,
   }
 
   std::cout << "Created table in DuckDB" << std::endl;
-
-  //table_arg.s->file->read_rnd_init(true);
   
-  /*while (!table_arg.s->file->is_eof()) {
-    auto buf = std::make_unique<unsigned char[]>(table_arg.s->reclength);
-    table_arg.s->file->read_rnd_next(buf.get());
+  auto res = table_arg.file->ha_rnd_init(true);
+  if(res != 0) {
+
+  }
   
-    std::string insert_query = "INSERT INTO " +
-                               std::string(table_arg.s->db.str) + "_" +
-                               std::string(table_arg.s->table_name.str) +
-                               " VALUES (";
-    for (Field **field = table_arg.s->field; *field; field++) {
-      char attribute_buffer[1024];
-      String attribute(attribute_buffer, sizeof(attribute_buffer), &my_charset_bin);
-      buffer.length(0);
-      if (field != table_arg.s->field) {
-        insert_query += ", ";
-      }
-      if ((*field)->is_null()) {
-        insert_query += "NULL";
-        continue;
-      }
-      switch((*field)->real_type()) {
-        case MYSQL_TYPE_TINY:
-        case MYSQL_TYPE_SHORT:
-        case MYSQL_TYPE_INT24:
-        case MYSQL_TYPE_LONG:
-        case MYSQL_TYPE_LONGLONG:
-        case MYSQL_TYPE_YEAR:
-          insert_query += std::to_string(((*field)->val_int()));
-          break;
-
-        case MYSQL_TYPE_FLOAT:
-        case MYSQL_TYPE_DOUBLE:
-        case MYSQL_TYPE_DECIMAL:
-        case MYSQL_TYPE_NEWDECIMAL:
-          insert_query += std::to_string(((*field)->val_real()));
-          break;
-
-        case MYSQL_TYPE_VAR_STRING:
-        case MYSQL_TYPE_VARCHAR:
-        case MYSQL_TYPE_STRING:
-          insert_query += "'" + std::string((*field)->val_str(&attribute,&attribute), (*field)->length()) + "'";
-          break;
-
-        case MYSQL_TYPE_TINY_BLOB:
-        case MYSQL_TYPE_MEDIUM_BLOB:
-        case MYSQL_TYPE_LONG_BLOB:
-        case MYSQL_TYPE_BLOB: {
-          // Convert blob to hex string
-          std::string hex_str = "X'";
-          for (unsigned long i = 0; i < (*field)->length(); i++) {
-            char buf[3];
-            snprintf(buf, sizeof(buf), "%02x", (unsigned char)(*field)->val_str()[i]);
-            hex_str += buf;
-          }
-          hex_str += "'";
-          insert_query += hex_str;
-          break;
-        }
-
-        case MYSQL_TYPE_JSON:
-          insert_query += "'" + std::string((*field)->val_str(&attribute, &attribute), (*field)->length()) + "'";
-          break;
-
-        case MYSQL_TYPE_DATE:
-        case MYSQL_TYPE_NEWDATE: {
-          // Format date as 'YYYY-MM-DD'
-          char date_str[11];
-          snprintf(date_str, sizeof(date_str), "'%04d-%02d-%02d'",
-                   (*field)->get_date().year, (*field)->get_date().month, (*field)->get_date().day);
-          insert_query += date_str;
-          break;
-        }
-
-        case MYSQL_TYPE_DATETIME:
-        case MYSQL_TYPE_TIMESTAMP: {
-          // Format datetime as 'YYYY-MM-DD HH:MM:SS'
-          char datetime_str[20];
-          
-          snprintf(datetime_str, sizeof(datetime_str), "'%04d-%02d-%02d %02d:%02d:%02d'",
-                   (*field)->get_datetime().year, (*field)->get_datetime().month, (*field)->get_datetime().day,
-                   (*field)->get_datetime().hour, (*field)->get_datetime().minute, (*field)->get_datetime().second);
-          insert_query += datetime_str;
-          break;
-        }
-
-      }
+const size_t reclen = table_arg.s->reclength;   // row length
+auto buf = std::make_unique<unsigned char[]>(reclen);
+while (table_arg.file->ha_rnd_next(buf.get()) != HA_ERR_END_OF_FILE) {
+  // Make the Field::ptr pointers valid by copying the row into record[0]
+  std::string insert_query = "";
+                               
+  for (Field **field = table_arg.s->field; *field; field++) {
+    char attribute_buffer[1024];
+    String attribute(attribute_buffer, sizeof(attribute_buffer), &my_charset_bin);
+    
+    if (insert_query != "") {
+      insert_query += ", ";
     }
-    insert_query += ");\n";
-
-    std::cout << insert_query << std::endl;
-
-    if (duckdb_query(con, insert_query.c_str(), nullptr) == DuckDBError) {
-      // handle error
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "Could not insert data into table in DuckDB");
+    if ((*field)->is_null()) {
+      insert_query += "NULL";
+      continue;
     }
+    switch((*field)->real_type()) {
+      case MYSQL_TYPE_TINY:
+      case MYSQL_TYPE_SHORT:
+      case MYSQL_TYPE_INT24:
+      case MYSQL_TYPE_LONG:
+      case MYSQL_TYPE_LONGLONG:
+      case MYSQL_TYPE_YEAR:
+        insert_query += std::to_string(((*field)->val_int()));
+        break;
+
+      case MYSQL_TYPE_FLOAT:
+      case MYSQL_TYPE_DOUBLE:
+      case MYSQL_TYPE_DECIMAL:
+      case MYSQL_TYPE_NEWDECIMAL:
+        insert_query += std::to_string(((*field)->val_real()));
+        break;
+
+      case MYSQL_TYPE_VAR_STRING:
+      case MYSQL_TYPE_VARCHAR:
+      case MYSQL_TYPE_STRING:
+      case MYSQL_TYPE_TINY_BLOB:
+      case MYSQL_TYPE_MEDIUM_BLOB:
+      case MYSQL_TYPE_LONG_BLOB:
+      case MYSQL_TYPE_BLOB:
+        insert_query += "'" + std::string((*field)->val_str(&attribute,&attribute)->c_ptr()) + "'";
+        break;
+
+      
+      case MYSQL_TYPE_JSON:
+      case MYSQL_TYPE_DATE:
+      case MYSQL_TYPE_NEWDATE:
+      case MYSQL_TYPE_DATETIME:
+      case MYSQL_TYPE_TIMESTAMP:
+      
+        insert_query += "'" + std::string((*field)->val_str(&attribute, &attribute)->c_ptr()) + "'";
+        break;
+    }
+  }
+  insert_query = "INSERT INTO " +
+                  std::string(table_arg.s->db.str) + "_" +
+                  std::string(table_arg.s->table_name.str) +
+                  " VALUES (" + insert_query + ")";
+  
+  std::cout << insert_query << std::endl;
+
+  if (duckdb_query(con, insert_query.c_str(), nullptr) == DuckDBError) {
+    // handle error
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+              "Could not insert data into table in DuckDB");
+  }
 
   }
   std::cout << "Inserted data into table in DuckDB" << std::endl;
-
-  */
 
   // cleanup
   duckdb_disconnect(&con);
