@@ -439,9 +439,33 @@ int ha_rapid::unload_table(const char *db_name, const char *table_name,
              "Table is not loaded on a secondary engine");
     return 1;
   } else {
-    loaded_tables->erase(db_name, table_name);
-    return 0;
+    duckdb_database db;
+    duckdb_connection con;
+
+    if (duckdb_open("rapid.duckdb", &db) == DuckDBError) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "Could not open DuckDB database");
+    }
+
+    if (duckdb_connect(db, &con) == DuckDBError) {
+      // handle error
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "Could not connect to DuckDB database");     
+    }
+    std::string drop_table_query = "DROP TABLE IF EXISTS " + std::string(db_name) + "_" + std::string(table_name);
+    if (duckdb_query(con, drop_table_query.c_str(), nullptr) == DuckDBError) {
+      // handle error
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "Could not drop table in DuckDB");
+    }
+    // cleanup
+    duckdb_disconnect(&con);
+    duckdb_close(&db);
   }
+  loaded_tables->erase(db_name, table_name);
+  my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "Dropped table in DuckDB");
+  return 0;
 }
 
 }  // namespace rapid
