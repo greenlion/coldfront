@@ -12,6 +12,12 @@ INSTALL PLUGIN rapid SONAME 'ha_rapid.so';
 ## LD_PRELOAD
 On 64 bit intel/amd architectures it may be necessary to LD_PRELOAD the ha_rapid.so library because DuckDB is so large.  This problem does not appear on aarch64 machines like Apple Silicon.
 
+You will see something like this if LD_PRELOAD is necessary:
+```
+mysql> install plugin rapid soname 'ha_rapid.so';
+ERROR 1126 (HY000): Can't open shared library '/home/justin/mysql/8.4/lib/plugin/ha_rapid.so' (errno: 11 /home/justin/mysql/8.4/lib/plugin/ha_rapid.so: cannot allocate memory in static TLS block)
+```
+
 # usage
 ## Load table into secondary engine
 ```
