@@ -234,3 +234,17 @@ mysql> show status like '%rapid%';
 +-------------------------------+-----------------+
 2 rows in set (0.01 sec)
 ```
+## global variables
+```
+mysql> show global variables like '%rapid%';
++----------------------+----------+
+| Variable_name        | Value    |
++----------------------+----------+
+| rapid_batch_size     | 1000     |
+| rapid_binlog_enabled | ON       |
+| rapid_database_file  | :memory: |
++----------------------+----------+
+3 rows in set (0.00 sec)
+```
+If you want to store DuckDB data on disk, set the --loose-rapid-database-file=filename.db option.  This is for when data size exceeds memory.
+To pause binlog consumer update rapid_binlog_enabled to OFF
