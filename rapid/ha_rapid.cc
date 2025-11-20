@@ -83,6 +83,24 @@ class Table;
 
 namespace {
 
+// Configuration variable for DuckDB database path
+static char *rapid_database_file = nullptr;
+
+static MYSQL_SYSVAR_STR(
+    database_file,
+    rapid_database_file,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_READONLY,
+    "Path to DuckDB database file. Use ':memory:' for in-memory database. Read-only, set at startup.",
+    nullptr,  // check function
+    nullptr,  // update function
+    ":memory:"  // default value
+);
+
+static SYS_VAR *rapid_system_variables[] = {
+    MYSQL_SYSVAR(database_file),
+    nullptr
+};
+
 struct RapidShare {
   THR_LOCK lock;
   RapidShare() { thr_lock_init(&lock); }
@@ -1780,7 +1798,8 @@ static int Init(MYSQL_PLUGIN p) {
                               SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
   hton->secondary_engine_modify_access_path_cost = ModifyAccessPathCost;
 
-  if (duckdb_open(":memory:", &rapid::db) == DuckDBError) {
+  const char *db_path = rapid_database_file ? rapid_database_file : ":memory:";
+  if (duckdb_open(db_path, &rapid::db) == DuckDBError) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
              "Could not open DuckDB database");
     return 1;
@@ -1811,6 +1830,34 @@ static int Deinit(MYSQL_PLUGIN) {
   return 0;
 }
 
+// Combine RAPID system variables with binlog consumer system variables
+static SYS_VAR **get_all_system_vars() {
+  static SYS_VAR *all_vars[32];  // Enough space for both sets
+  static bool initialized = false;
+  
+  if (!initialized) {
+    int idx = 0;
+    
+    // Add RAPID system variables
+    for (int i = 0; rapid_system_variables[i] != nullptr; i++) {
+      all_vars[idx++] = rapid_system_variables[i];
+    }
+    
+    // Add binlog consumer system variables
+    st_mysql_sys_var **binlog_vars = rapid_binlog_get_system_vars();
+    if (binlog_vars) {
+      for (int i = 0; binlog_vars[i] != nullptr; i++) {
+        all_vars[idx++] = reinterpret_cast<SYS_VAR*>(binlog_vars[i]);
+      }
+    }
+    
+    all_vars[idx] = nullptr;
+    initialized = true;
+  }
+  
+  return all_vars;
+}
+
 static st_mysql_storage_engine rapid_storage_engine{
     MYSQL_HANDLERTON_INTERFACE_VERSION};
 
@@ -1826,7 +1873,7 @@ mysql_declare_plugin(rapid){
     Deinit,
     0x0001,
     reinterpret_cast<SHOW_VAR*>(rapid_binlog_get_status_vars()),  // Status variables (read-only)
-    reinterpret_cast<SYS_VAR**>(rapid_binlog_get_system_vars()),  // System variables (read-write)
+    get_all_system_vars(),  // Combined system variables (RAPID + binlog consumer)
     nullptr,
     0,
 } mysql_declare_plugin_end;

@@ -69,9 +69,19 @@ extern duckdb_database db;
 // Use event type constants from the binlog event library
 using namespace mysql::binlog::event;
 
-// Plugin-compatible logging: LogErr is not available in plugins, so we disable it
-// In production, you could replace these with my_plugin_log_message() or file logging
-#define LogErr(level, errcode, ...) do { } while(0)
+// Plugin-compatible logging using fprintf to stderr (goes to MySQL error log)
+#define LogErr(level, errcode, msg) do { \
+  const char *level_str = "INFO"; \
+  if (level == ERROR_LEVEL) level_str = "ERROR"; \
+  else if (level == WARNING_LEVEL) level_str = "WARNING"; \
+  time_t now = time(nullptr); \
+  struct tm tm_buf; \
+  localtime_r(&now, &tm_buf); \
+  char time_str[64]; \
+  strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf); \
+  fprintf(stderr, "[%s] [RAPID Binlog] %s: %s\n", time_str, level_str, msg); \
+  fflush(stderr); \
+} while(0)
 
 // Helper classes to access protected members of Rows_log_event
 // Since m_rows_buf, m_curr_row, m_rows_end, m_width are protected, we use inheritance
@@ -94,8 +104,6 @@ namespace rapid_binlog {
 // Configuration
 static bool binlog_consumer_enabled = true;
 static unsigned long batch_size = 1000;
-static char *binlog_file = nullptr;
-static unsigned long binlog_position = 4;  // Start of first event
 
 // Status tracking (current position being read)
 static std::atomic<unsigned long> current_binlog_position{4};
@@ -431,6 +439,7 @@ bool apply_changes_to_duckdb(std::vector<ChangeRecord> &changes) {
   // Group INSERTs by table for bulk insert syntax
   // Map: table_name -> vector of VALUES clauses
   std::map<std::string, std::vector<std::string>> insert_batches;
+  std::map<std::string, std::string> table_insert_prefix;  // Cache "INSERT INTO table " part
   std::vector<std::string> other_statements;
   
   for (const auto &change : changes) {
@@ -442,14 +451,25 @@ bool apply_changes_to_duckdb(std::vector<ChangeRecord> &changes) {
         continue;
       }
       
-      // Find "VALUES" in the SQL
+      // Build table key for grouping
+      std::string table_key = change.db_name + "." + change.table_name;
+      
+      // Cache the INSERT prefix (only compute once per table)
+      if (table_insert_prefix.find(table_key) == table_insert_prefix.end()) {
+        size_t values_pos = sql.find("VALUES");
+        if (values_pos != std::string::npos) {
+          table_insert_prefix[table_key] = sql.substr(0, values_pos); // "INSERT INTO table "
+        } else {
+          error_count++;
+          continue;
+        }
+      }
+      
+      // Extract just the VALUES (...) part
       size_t values_pos = sql.find("VALUES");
       if (values_pos != std::string::npos) {
-        std::string table_part = sql.substr(0, values_pos); // "INSERT INTO table "
         std::string values_part = sql.substr(values_pos + 7); // Skip "VALUES "
-        
-        // Add to batch for this table
-        insert_batches[table_part].push_back(values_part);
+        insert_batches[table_key].push_back(values_part);
       } else {
         error_count++;
       }
@@ -472,23 +492,25 @@ bool apply_changes_to_duckdb(std::vector<ChangeRecord> &changes) {
   
   // Execute bulk INSERTs
   for (const auto &batch : insert_batches) {
-    const std::string &table_part = batch.first;
+    const std::string &table_key = batch.first;
     const std::vector<std::string> &values_list = batch.second;
+    const std::string &table_prefix = table_insert_prefix[table_key];
     
     // Build: INSERT INTO table VALUES (row1), (row2), (row3), ...
     // Split into chunks of 1000 rows to avoid SQL size limits
     const size_t BULK_INSERT_SIZE = 1000;
     for (size_t i = 0; i < values_list.size(); i += BULK_INSERT_SIZE) {
-      std::ostringstream bulk_insert;
-      bulk_insert << table_part << "VALUES ";
+      std::string sql;
+      sql.reserve(65536);  // Reserve 64KB to avoid realloc penalties
+      
+      sql.append(table_prefix);
+      sql.append("VALUES ");
       
       size_t end = std::min(i + BULK_INSERT_SIZE, values_list.size());
       for (size_t j = i; j < end; ++j) {
-        if (j > i) bulk_insert << ", ";
-        bulk_insert << values_list[j];
+        if (j > i) sql.append(", ");
+        sql.append(values_list[j]);
       }
-      
-      std::string sql = bulk_insert.str();
       
       if (duckdb_query(con, sql.c_str(), &result) == DuckDBError) {
         const char *error = duckdb_result_error(&result);
@@ -1241,7 +1263,8 @@ void process_table_map(Table_map_log_event *event) {
       
       case MYSQL_TYPE_ENUM:
       case MYSQL_TYPE_SET:
-        // 1-2 bytes depending on count, for now read 2
+        // Always 2 bytes of metadata in Table_map_event
+        // The metadata value itself indicates how many bytes the actual value uses (1 or 2)
         col.meta = meta_ptr[0] | (meta_ptr[1] << 8);
         meta_ptr += 2;
         break;
@@ -1432,38 +1455,33 @@ void binlog_reader_thread_func() {
   
   // Determine starting position
   char log_file_name[FN_REFLEN];
-  my_off_t start_pos = binlog_position;
+  my_off_t start_pos = 4;  // Default binlog position
   
-  if (binlog_file != nullptr && strlen(binlog_file) > 0) {
-    strncpy(log_file_name, binlog_file, FN_REFLEN - 1);
-    log_file_name[FN_REFLEN - 1] = '\0';
-  } else {
-    // Auto-detect: use current active binlog (not the first/oldest one)
-    LOG_INFO log_info;
-    int result = ::mysql_bin_log.get_current_log(&log_info);
+  // Auto-detect: use current active binlog (not the first/oldest one)
+  LOG_INFO log_info;
+  int result = ::mysql_bin_log.get_current_log(&log_info);
+  fflush(stderr);
+  
+  if (result != 0) {
+    fprintf(stderr, "[RAPID] ERROR: Could not get current active binlog (error code: %d)\n", result);
     fflush(stderr);
-    
-    if (result != 0) {
-      fprintf(stderr, "[RAPID] ERROR: Could not get current active binlog (error code: %d)\n", result);
-      fflush(stderr);
-      return;
-    }
-    
-    if (log_info.log_file_name[0] == '\0') {
-      fprintf(stderr, "[RAPID] ERROR: get_current_log returned empty filename\n");
-      fflush(stderr);
-      return;
-    }
-    
-    strncpy(log_file_name, log_info.log_file_name, FN_REFLEN - 1);
-    log_file_name[FN_REFLEN - 1] = '\0';
-    
-    // Start from current position in the active binlog
-    // This ensures we only capture NEW events, not old historical data
-    start_pos = log_info.pos;
-    
-    fflush(stderr);
+    return;
   }
+  
+  if (log_info.log_file_name[0] == '\0') {
+    fprintf(stderr, "[RAPID] ERROR: get_current_log returned empty filename\n");
+    fflush(stderr);
+    return;
+  }
+  
+  strncpy(log_file_name, log_info.log_file_name, FN_REFLEN - 1);
+  log_file_name[FN_REFLEN - 1] = '\0';
+  
+  // Start from current position in the active binlog
+  // This ensures we only capture NEW events, not old historical data
+  start_pos = log_info.pos;
+  
+  fflush(stderr);
   
   fflush(stderr);
   
@@ -1694,7 +1712,7 @@ static int plugin_deinit(MYSQL_PLUGIN plugin_info [[maybe_unused]]) {
   System variables.
 */
 static MYSQL_SYSVAR_BOOL(
-    enabled,
+    binlog_enabled,
     binlog_consumer_enabled,
     PLUGIN_VAR_RQCMDARG,
     "Enable binlog-based incremental replication to DuckDB",
@@ -1714,32 +1732,9 @@ static MYSQL_SYSVAR_ULONG(
     100000,
     0);
 
-static MYSQL_SYSVAR_STR(
-    binlog_file,
-    binlog_file,
-    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
-    "Binlog file to start reading from (default: auto-detect)",
-    nullptr,
-    nullptr,
-    nullptr);
-
-static MYSQL_SYSVAR_ULONG(
-    binlog_position,
-    binlog_position,
-    PLUGIN_VAR_RQCMDARG,
-    "Binlog position to start reading from",
-    nullptr,
-    nullptr,
-    4,
-    4,
-    0xFFFFFFFFUL,
-    0);
-
 static SYS_VAR *plugin_system_vars[] = {
-    MYSQL_SYSVAR(enabled),
+    MYSQL_SYSVAR(binlog_enabled),
     MYSQL_SYSVAR(batch_size),
-    MYSQL_SYSVAR(binlog_file),
-    MYSQL_SYSVAR(binlog_position),
     nullptr};
 
 /**
