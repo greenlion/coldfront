@@ -1221,6 +1221,21 @@ std::string strip_backticks_from_select(const std::string& sql) {
 
 namespace {
 bool SecondaryEnginePrePrepareHook(THD *thd) {
+  // Don't offload INSERT/UPDATE/DELETE statements to secondary engine
+  // These should always execute on the primary engine (InnoDB)
+  LEX *lex = thd->lex;
+  if (lex->sql_command == SQLCOM_INSERT || 
+      lex->sql_command == SQLCOM_INSERT_SELECT ||
+      lex->sql_command == SQLCOM_UPDATE ||
+      lex->sql_command == SQLCOM_UPDATE_MULTI ||
+      lex->sql_command == SQLCOM_DELETE ||
+      lex->sql_command == SQLCOM_DELETE_MULTI ||
+      lex->sql_command == SQLCOM_REPLACE ||
+      lex->sql_command == SQLCOM_REPLACE_SELECT ||
+      lex->sql_command == SQLCOM_LOAD) {
+    return false;  // Don't use secondary engine
+  }
+
   if (thd->m_current_query_cost <=
       static_cast<double>(thd->variables.secondary_engine_cost_threshold)) {
     Opt_trace_context *const trace = &thd->opt_trace;
@@ -1251,6 +1266,20 @@ static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), "");
     return true;
   });
+
+  // Don't offload INSERT/UPDATE/DELETE statements to secondary engine
+  // These should always execute on the primary engine (InnoDB)
+  if (lex->sql_command == SQLCOM_INSERT || 
+      lex->sql_command == SQLCOM_INSERT_SELECT ||
+      lex->sql_command == SQLCOM_UPDATE ||
+      lex->sql_command == SQLCOM_UPDATE_MULTI ||
+      lex->sql_command == SQLCOM_DELETE ||
+      lex->sql_command == SQLCOM_DELETE_MULTI ||
+      lex->sql_command == SQLCOM_REPLACE ||
+      lex->sql_command == SQLCOM_REPLACE_SELECT ||
+      lex->sql_command == SQLCOM_LOAD) {
+    return true;  // Reject offloading
+  }
 
   auto context = new (thd->mem_root) Rapid_execution_context;
   if (context == nullptr) return true;

@@ -428,31 +428,88 @@ bool apply_changes_to_duckdb(std::vector<ChangeRecord> &changes) {
   size_t success_count = 0;
   size_t error_count = 0;
   
+  // Group INSERTs by table for bulk insert syntax
+  // Map: table_name -> vector of VALUES clauses
+  std::map<std::string, std::vector<std::string>> insert_batches;
+  std::vector<std::string> other_statements;
+  
   for (const auto &change : changes) {
-    std::string sql;
-    
-    switch (change.type) {
-      case ChangeRecord::INSERT:
-        sql = generate_insert_sql(change);
-        break;
-      case ChangeRecord::UPDATE:
+    if (change.type == ChangeRecord::INSERT) {
+      // Extract the VALUES clause from INSERT INTO table VALUES (...)
+      std::string sql = generate_insert_sql(change);
+      if (sql.empty()) {
+        error_count++;
+        continue;
+      }
+      
+      // Find "VALUES" in the SQL
+      size_t values_pos = sql.find("VALUES");
+      if (values_pos != std::string::npos) {
+        std::string table_part = sql.substr(0, values_pos); // "INSERT INTO table "
+        std::string values_part = sql.substr(values_pos + 7); // Skip "VALUES "
+        
+        // Add to batch for this table
+        insert_batches[table_part].push_back(values_part);
+      } else {
+        error_count++;
+      }
+    } else {
+      // UPDATE and DELETE - execute individually
+      std::string sql;
+      if (change.type == ChangeRecord::UPDATE) {
         sql = generate_update_sql(change, con);
-        break;
-      case ChangeRecord::DELETE:
+      } else if (change.type == ChangeRecord::DELETE) {
         sql = generate_delete_sql(change, con);
-        break;
+      }
+      
+      if (!sql.empty()) {
+        other_statements.push_back(sql);
+      } else {
+        error_count++;
+      }
     }
+  }
+  
+  // Execute bulk INSERTs
+  for (const auto &batch : insert_batches) {
+    const std::string &table_part = batch.first;
+    const std::vector<std::string> &values_list = batch.second;
     
-    if (sql.empty()) {
-      error_count++;
-      continue;
+    // Build: INSERT INTO table VALUES (row1), (row2), (row3), ...
+    // Split into chunks of 1000 rows to avoid SQL size limits
+    const size_t BULK_INSERT_SIZE = 1000;
+    for (size_t i = 0; i < values_list.size(); i += BULK_INSERT_SIZE) {
+      std::ostringstream bulk_insert;
+      bulk_insert << table_part << "VALUES ";
+      
+      size_t end = std::min(i + BULK_INSERT_SIZE, values_list.size());
+      for (size_t j = i; j < end; ++j) {
+        if (j > i) bulk_insert << ", ";
+        bulk_insert << values_list[j];
+      }
+      
+      std::string sql = bulk_insert.str();
+      
+      if (duckdb_query(con, sql.c_str(), &result) == DuckDBError) {
+        const char *error = duckdb_result_error(&result);
+        LogErr(ERROR_LEVEL, ER_SECONDARY_ENGINE_PLUGIN,
+               ("RAPID Binlog: Bulk INSERT of " + std::to_string(end - i) + 
+                " rows failed. Error: " + (error ? std::string(error) : "unknown")).c_str());
+        error_count += (end - i);
+      } else {
+        success_count += (end - i);
+      }
+      duckdb_destroy_result(&result);
     }
-    
+  }
+  
+  // Execute UPDATE and DELETE statements
+  for (const auto &sql : other_statements) {
     if (duckdb_query(con, sql.c_str(), &result) == DuckDBError) {
       const char *error = duckdb_result_error(&result);
-      LogErr(WARNING_LEVEL, ER_SECONDARY_ENGINE_PLUGIN,
-             ("RAPID Binlog: Failed: " + sql + " Error: " + 
-              (error ? error : "unknown")).c_str());
+      LogErr(ERROR_LEVEL, ER_SECONDARY_ENGINE_PLUGIN,
+             ("RAPID Binlog: Statement failed: " + sql + " Error: " + 
+              (error ? std::string(error) : "unknown")).c_str());
       error_count++;
     } else {
       success_count++;
@@ -542,8 +599,19 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
       return std::to_string(value);
     }
     
-    case MYSQL_TYPE_LONG:
     case MYSQL_TYPE_INT24: {
+      // MEDIUMINT: 3 bytes
+      uint32_t value = ptr[0] | (ptr[1] << 8) | (ptr[2] << 16);
+      ptr += 3;
+      // Handle sign extension for signed MEDIUMINT
+      if (value & 0x800000) {
+        value |= 0xFF000000;
+      }
+      return std::to_string(static_cast<int32_t>(value));
+    }
+    
+    case MYSQL_TYPE_LONG: {
+      // INT: 4 bytes
       int32_t value = read_little_endian<int32_t>(ptr);
       return std::to_string(value);
     }
@@ -724,27 +792,43 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
     }
     
     case MYSQL_TYPE_STRING: {
-      // Fixed-length string (CHAR)
-      // Meta contains actual length (high byte) and type (low byte)
+      // Fixed-length string (CHAR) or ENUM/SET
+      // Meta contains max length (high byte) and real type (low byte)
       uint32_t real_type = meta & 0xFF;
-      uint32_t length = meta >> 8;
+      uint32_t max_length = meta >> 8;
       
       if (real_type == MYSQL_TYPE_ENUM || real_type == MYSQL_TYPE_SET) {
         // ENUM/SET stored as integer
-        if (length == 1) {
+        if (max_length == 1) {
           uint8_t val = *ptr++;
           return std::to_string(val);
-        } else if (length == 2) {
+        } else if (max_length == 2) {
           uint16_t val = read_little_endian<uint16_t>(ptr);
           return std::to_string(val);
         }
       }
       
-      std::string value(reinterpret_cast<const char*>(ptr), length);
-      ptr += length;
+      // For CHAR with multibyte charset, it's stored with length prefix
+      // If max_length < 256, use 1-byte length prefix, else 2-byte
+      uint32_t actual_length;
+      if (max_length < 256) {
+        actual_length = *ptr++;
+      } else {
+        actual_length = read_little_endian<uint16_t>(ptr);
+      }
+      
+      std::string value(reinterpret_cast<const char*>(ptr), actual_length);
+      ptr += actual_length;
       
       // Trim trailing spaces for CHAR
-      value.erase(value.find_last_not_of(' ') + 1);
+      if (!value.empty()) {
+        size_t last = value.find_last_not_of(' ');
+        if (last != std::string::npos) {
+          value.erase(last + 1);
+        } else {
+          value.clear(); // All spaces
+        }
+      }
       
       return "'" + escape_sql_string(value) + "'";
     }
@@ -885,19 +969,25 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
   @param cols Bitmap of columns present in this image
   @param columns Output: parsed column name/value pairs
 */
-void parse_binlog_row(const TableMapInfo &table_info, const uchar *row_data,
+const uchar* parse_binlog_row(const TableMapInfo &table_info, const uchar *row_data,
                      const MY_BITMAP *cols,
                      std::vector<std::pair<std::string, std::string>> &columns) {
   columns.clear();
   
   if (!row_data || !cols) {
-    return;
+    return row_data;
   }
   
   // First, skip the NULL bitmap
-  // NULL bitmap has one bit per column in the image
-  uint null_bit_count = bitmap_bits_set(cols);
-  uint null_byte_count = (null_bit_count + 7) / 8;
+  // NULL bitmap has one bit per column in the image (not just non-null columns!)
+  // Count how many columns are in this row image
+  uint columns_in_image = 0;
+  for (uint i = 0; i < table_info.column_count; i++) {
+    if (bitmap_is_set(cols, i)) {
+      columns_in_image++;
+    }
+  }
+  uint null_byte_count = (columns_in_image + 7) / 8;
   const uchar *null_bits = row_data;
   const uchar *field_data = row_data + null_byte_count;
   
@@ -921,13 +1011,15 @@ void parse_binlog_row(const TableMapInfo &table_info, const uchar *row_data,
     uint null_bit = null_bit_index % 8;
     bool is_null = (null_byte < null_byte_count) && (null_bits[null_byte] & (1 << null_bit));
     
-    // Parse the field value
+    // Parse the field value (this advances field_data pointer)
     std::string value = parse_field_value(field_data, col_meta.type, col_meta.meta, is_null);
     
     columns.push_back({col_meta.name, value});
     field_index++;
   }
   
+  // Return pointer after this row (field_data has been advanced by parse_field_value calls)
+  return field_data;
 }
 
 /**
@@ -956,21 +1048,29 @@ void process_write_rows(Write_rows_log_event *event) {
     static_cast<Rows_log_event*>(event));
   
   const uchar *rows_buf = accessor->get_rows_buf_pub();
+  const uchar *rows_end = accessor->get_rows_end_pub();
   const MY_BITMAP *cols = event->get_cols();
   
-  // Parse the row data using column metadata
-  ChangeRecord change;
-  change.type = ChangeRecord::INSERT;
-  change.db_name = table_info.db_name;
-  change.table_name = table_info.table_name;
+  // Parse ALL rows in this event (not just the first one!)
+  const uchar *ptr = rows_buf;
+  size_t row_count = 0;
   
-  parse_binlog_row(table_info, rows_buf, cols, change.columns);
-  
-  
-  // Queue the change
-  {
-    std::lock_guard<std::mutex> queue_lock(queue_mutex);
-    change_queue.push(change);
+  while (ptr < rows_end) {
+    ChangeRecord change;
+    change.type = ChangeRecord::INSERT;
+    change.db_name = table_info.db_name;
+    change.table_name = table_info.table_name;
+    
+    // parse_binlog_row returns pointer after this row
+    ptr = parse_binlog_row(table_info, ptr, cols, change.columns);
+    
+    // Queue the change
+    {
+      std::lock_guard<std::mutex> queue_lock(queue_mutex);
+      change_queue.push(change);
+    }
+    
+    row_count++;
   }
 }
 
@@ -998,31 +1098,33 @@ void process_update_rows(Update_rows_log_event *event) {
     static_cast<Rows_log_event*>(event));
   
   const uchar *rows_buf = accessor->get_rows_buf_pub();
+  const uchar *rows_end = accessor->get_rows_end_pub();
   const MY_BITMAP *cols_bi = event->get_cols();      // Before Image columns
   const MY_BITMAP *cols_ai = event->get_cols_ai();   // After Image columns
   
-  ChangeRecord change;
-  change.type = ChangeRecord::UPDATE;
-  change.db_name = table_info.db_name;
-  change.table_name = table_info.table_name;
-  
-  // Parse before image (old values)
+  // Parse ALL rows in this event
   const uchar *ptr = rows_buf;
-  parse_binlog_row(table_info, ptr, cols_bi, change.old_columns);
+  size_t row_count = 0;
   
-  // Advance pointer past before image to after image
-  // This is approximate - in reality need to calculate exact size
-  // For now, rely on parse_binlog_row advancing the pointer
-  
-  // Parse after image (new values)
-  // Note: This is simplified, should track pointer position properly
-  parse_binlog_row(table_info, ptr, cols_ai, change.columns);
-  
-  
-  // Queue the change
-  {
-    std::lock_guard<std::mutex> queue_lock(queue_mutex);
-    change_queue.push(change);
+  while (ptr < rows_end) {
+    ChangeRecord change;
+    change.type = ChangeRecord::UPDATE;
+    change.db_name = table_info.db_name;
+    change.table_name = table_info.table_name;
+    
+    // Parse before image (old values)
+    ptr = parse_binlog_row(table_info, ptr, cols_bi, change.old_columns);
+    
+    // Parse after image (new values)
+    ptr = parse_binlog_row(table_info, ptr, cols_ai, change.columns);
+    
+    // Queue the change
+    {
+      std::lock_guard<std::mutex> queue_lock(queue_mutex);
+      change_queue.push(change);
+    }
+    
+    row_count++;
   }
 }
 
@@ -1050,21 +1152,29 @@ void process_delete_rows(Delete_rows_log_event *event) {
     static_cast<Rows_log_event*>(event));
   
   const uchar *rows_buf = accessor->get_rows_buf_pub();
+  const uchar *rows_end = accessor->get_rows_end_pub();
   const MY_BITMAP *cols = event->get_cols();
   
-  ChangeRecord change;
-  change.type = ChangeRecord::DELETE;
-  change.db_name = table_info.db_name;
-  change.table_name = table_info.table_name;
+  // Parse ALL rows in this event
+  const uchar *ptr = rows_buf;
+  size_t row_count = 0;
   
-  // Parse the row data using column metadata
-  parse_binlog_row(table_info, rows_buf, cols, change.columns);
-  
-  
-  // Queue the change
-  {
-    std::lock_guard<std::mutex> queue_lock(queue_mutex);
-    change_queue.push(change);
+  while (ptr < rows_end) {
+    ChangeRecord change;
+    change.type = ChangeRecord::DELETE;
+    change.db_name = table_info.db_name;
+    change.table_name = table_info.table_name;
+    
+    // parse_binlog_row returns pointer after this row
+    ptr = parse_binlog_row(table_info, ptr, cols, change.columns);
+    
+    // Queue the change
+    {
+      std::lock_guard<std::mutex> queue_lock(queue_mutex);
+      change_queue.push(change);
+    }
+    
+    row_count++;
   }
 }
 
@@ -1099,10 +1209,49 @@ void process_table_map(Table_map_log_event *event) {
   info.column_count = base_event->m_colcnt;
   
   // Extract column types and metadata
+  // Parse m_field_metadata to get metadata for each column
+  const unsigned char *meta_ptr = base_event->m_field_metadata;
   for (uint i = 0; i < info.column_count; i++) {
     ColumnMetadata col;
     col.type = base_event->m_coltype[i];
-    col.meta = 0;  // Will extract from m_field_metadata if needed
+    
+    // Extract metadata based on type
+    // Different types have different metadata sizes
+    switch (col.type) {
+      case MYSQL_TYPE_FLOAT:
+      case MYSQL_TYPE_DOUBLE:
+      case MYSQL_TYPE_BLOB:
+      case MYSQL_TYPE_GEOMETRY:
+      case MYSQL_TYPE_JSON:
+        col.meta = *meta_ptr++;
+        break;
+      
+      case MYSQL_TYPE_BIT:
+      case MYSQL_TYPE_VARCHAR:
+      case MYSQL_TYPE_NEWDECIMAL:
+      case MYSQL_TYPE_VAR_STRING:
+      case MYSQL_TYPE_STRING:
+      case MYSQL_TYPE_TIME2:
+      case MYSQL_TYPE_DATETIME2:
+      case MYSQL_TYPE_TIMESTAMP2:
+        // 2 bytes of metadata
+        col.meta = meta_ptr[0] | (meta_ptr[1] << 8);
+        meta_ptr += 2;
+        break;
+      
+      case MYSQL_TYPE_ENUM:
+      case MYSQL_TYPE_SET:
+        // 1-2 bytes depending on count, for now read 2
+        col.meta = meta_ptr[0] | (meta_ptr[1] << 8);
+        meta_ptr += 2;
+        break;
+      
+      default:
+        // No metadata or 0 bytes
+        col.meta = 0;
+        break;
+    }
+    
     col.is_nullable = false;  // Will check NULL bits if available
     col.name = "col_" + std::to_string(i);  // Default name, may be overridden
     
