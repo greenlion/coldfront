@@ -1796,7 +1796,7 @@ static int Init(MYSQL_PLUGIN p) {
   hton->secondary_engine_flags =
       MakeSecondaryEngineFlags(SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
                               SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
-  hton->secondary_engine_modify_access_path_cost = ModifyAccessPathCost;
+  hton->secondary_engine_modify_view_ap_cost = ModifyAccessPathCost;
 
   const char *db_path = rapid_database_file ? rapid_database_file : ":memory:";
   if (duckdb_open(db_path, &rapid::db) == DuckDBError) {

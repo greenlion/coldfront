@@ -1458,7 +1458,7 @@ void binlog_reader_thread_func() {
   my_off_t start_pos = 4;  // Default binlog position
   
   // Auto-detect: use current active binlog (not the first/oldest one)
-  LOG_INFO log_info;
+  Log_info log_info;
   int result = ::mysql_bin_log.get_current_log(&log_info);
   fflush(stderr);
   
