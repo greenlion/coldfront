@@ -2,8 +2,26 @@
 Plugins and components for a MySQL Heatwave-like secondary engine duckdb implementation.  Tested in the 8.4 branch of [https://github.com/mysql/mysql-server:8.4](https://github.com/mysql/mysql-server/tree/8.4)
 
 # compile
-place the rapid/ folder in the mysql-server/storage folder
-compile the server as normal
+place (symlink) the storage/rapid/ folder in the mysql-server/storage folder
+```
+cd mysql-server/storage
+ln -s /path/to/coldfront/storage/rapid .
+```
+
+compile the server as normal or
+```
+cmake /path/to/mysql-server
+make rapid
+```
+
+# test
+place the mysql-test/rapid folder into the mysql-test/suite folder
+```
+cd mysql-server/mysql-test/suite
+ln -s /path/to/coldfront/mysql-test/rapid .
+cd rapid
+./run_rapid_tests.sh
+```
 
 # install
 ```
