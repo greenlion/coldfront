@@ -275,6 +275,24 @@ std::string ha_rapid::escape_string(std::string in) {
 int ha_rapid::create_duckdb_table(const TABLE &table_arg, duckdb_connection con) {
   std::string create_table_query = "";
 
+  // First pass: validate all column types are supported
+  for (Field **field = table_arg.field; *field; field++) {
+    enum_field_types field_type = (*field)->real_type();
+    
+    switch(field_type) {
+      case MYSQL_TYPE_GEOMETRY:
+      case MYSQL_TYPE_TYPED_ARRAY:
+      case MYSQL_TYPE_INVALID:
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "Unsupported column type in RAPID secondary engine");
+        return 1;
+      
+      default:
+        break;
+    }
+  }
+
+  // Second pass: build CREATE TABLE query
   for (Field **field = table_arg.field; *field; field++) {
     bool is_unsigned = (*field)->all_flags() & UNSIGNED_FLAG;
     bool is_nullable = (*field)->is_nullable();
@@ -317,9 +335,9 @@ int ha_rapid::create_duckdb_table(const TABLE &table_arg, duckdb_connection con)
 
       case MYSQL_TYPE_JSON:
         create_table_query += "JSON";
-        case MYSQL_TYPE_FLOAT:
         break;
 
+      case MYSQL_TYPE_FLOAT:
         create_table_query += "REAL";
         break;
 
@@ -328,9 +346,24 @@ int ha_rapid::create_duckdb_table(const TABLE &table_arg, duckdb_connection con)
         break;
 
       case MYSQL_TYPE_DECIMAL:
-      case MYSQL_TYPE_NEWDECIMAL:
-        create_table_query += "NUMERIC";
+      case MYSQL_TYPE_NEWDECIMAL: {
+        // Get precision and scale for DECIMAL/NUMERIC types
+        uint precision;
+        uint8 decimals = (*field)->decimals();
+        
+        // For NEWDECIMAL, get precision from Field_new_decimal
+        if ((*field)->real_type() == MYSQL_TYPE_NEWDECIMAL) {
+          Field_new_decimal *dec_field = static_cast<Field_new_decimal *>(*field);
+          precision = dec_field->precision;
+        } else {
+          // For old DECIMAL type
+          precision = (*field)->field_length;
+        }
+        
+        create_table_query += "DECIMAL(" + std::to_string(precision) + "," + 
+                              std::to_string(decimals) + ")";
         break;
+      }
 
       case MYSQL_TYPE_YEAR:
         create_table_query += "INTEGER";
@@ -357,13 +390,21 @@ int ha_rapid::create_duckdb_table(const TABLE &table_arg, duckdb_connection con)
       case MYSQL_TYPE_BIT:
       case MYSQL_TYPE_NULL:
       case MYSQL_TYPE_SET:
-      case MYSQL_TYPE_GEOMETRY:
-      case MYSQL_TYPE_TYPED_ARRAY:
-      case MYSQL_TYPE_INVALID:
       case MYSQL_TYPE_BOOL:
-      
-      create_table_query += "VARCHAR";
+        create_table_query += "VARCHAR";
         break;
+      
+      case MYSQL_TYPE_GEOMETRY:
+        // GEOMETRY not supported - should have been caught in validation
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "Unsupported GEOMETRY type in RAPID secondary engine");
+        return 1;
+      
+      default:
+        // Should never reach here due to validation pass
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "Unexpected column type in RAPID secondary engine");
+        return 1;
     }
     
     if(is_unsigned) {
@@ -488,16 +529,28 @@ int ha_rapid::load_table(const TABLE &table_arg,
         case MYSQL_TYPE_VARCHAR:
         case MYSQL_TYPE_VAR_STRING:
         case MYSQL_TYPE_STRING:
-        case MYSQL_TYPE_BLOB:
-        case MYSQL_TYPE_TINY_BLOB:
-        case MYSQL_TYPE_MEDIUM_BLOB:
-        case MYSQL_TYPE_LONG_BLOB:
         case MYSQL_TYPE_JSON: {
           String tmp;
           auto s = (*field)->val_str(&tmp);
           duckdb_append_varchar_length(appender, s->ptr(), s->length());
           break;
         }
+        
+        case MYSQL_TYPE_BLOB:
+        case MYSQL_TYPE_TINY_BLOB:
+        case MYSQL_TYPE_MEDIUM_BLOB:
+        case MYSQL_TYPE_LONG_BLOB: {
+          String tmp;
+          auto s = (*field)->val_str(&tmp);
+          // Use duckdb_append_blob for proper binary data handling
+          duckdb_append_blob(appender, s->ptr(), s->length());
+          break;
+        }
+        
+        case MYSQL_TYPE_GEOMETRY:
+          // GEOMETRY not supported
+          duckdb_append_null(appender);
+          break;
         
         default: {
           // For unsupported types, convert to string
@@ -579,8 +632,6 @@ int ha_rapid::unload_table(const char *db_name, const char *table_name,
   // Unregister from binlog consumer
   rapid_binlog_unregister_table(db_name, table_name);
   
-  my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "Dropped table in DuckDB");
   return 0;
 }
 
@@ -1811,6 +1862,7 @@ static int Init(MYSQL_PLUGIN p) {
     // Enable automatic installation and loading of known extensions
     duckdb_query(init_con, "SET autoinstall_known_extensions=1", nullptr);
     duckdb_query(init_con, "SET autoload_known_extensions=1", nullptr);
+    
     duckdb_disconnect(&init_con);
   }
   
