@@ -60,6 +60,8 @@
 #include "sql/sql_base.h"       // open_table_def, open_table_from_share
 #include "sql/sql_class.h"
 #include "sql/table.h"
+#include "sql/log.h"  // sql_print_error, sql_print_warning
+#include "decimal.h"  // bin2decimal, decimal2string
 
 // Forward declare external DuckDB database handle
 namespace rapid {
@@ -423,6 +425,7 @@ bool apply_changes_to_duckdb(std::vector<ChangeRecord> &changes) {
            "RAPID Binlog: Failed to connect to DuckDB");
     return true;
   }
+  
   
   duckdb_result result;
   if (duckdb_query(con, "BEGIN TRANSACTION", &result) == DuckDBError) {
@@ -880,8 +883,6 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
         length |= static_cast<uint32_t>(*ptr++) << (i * 8);
       }
       
-      // For TEXT fields, we can return the string
-      // For binary BLOBs, might want to base64 encode or return placeholder
       std::string value(reinterpret_cast<const char*>(ptr), length);
       ptr += length;
       
@@ -889,18 +890,37 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
       if (value.find('\0') == std::string::npos) {
         return "'" + escape_sql_string(value) + "'";
       } else {
-        // Binary data - return placeholder
-        return "NULL";  // Or could base64 encode
+        // Binary data - encode as hex string using DuckDB's blob literal format
+        // DuckDB supports: '\xHEXSTRING'::BLOB where HEXSTRING has no separators
+        std::string hex = "'\\x";
+        hex.reserve(3 + length * 2 + 6);  // '\x' + 2 chars per byte + '::BLOB'
+        
+        for (size_t i = 0; i < length; i++) {
+          char hex_buf[3];
+          snprintf(hex_buf, sizeof(hex_buf), "%02x", static_cast<unsigned char>(value[i]));
+          hex += hex_buf;
+        }
+        hex += "'::BLOB";
+        return hex;
       }
     }
     
     case MYSQL_TYPE_NEWDECIMAL: {
       // DECIMAL stored in packed binary format
-      // Meta: precision (high byte) and scale (low byte)
-      uint precision = meta >> 8;
-      uint scale = meta & 0xFF;
+      // Meta: scale (high byte) and precision (low byte)
+      uint precision = meta & 0xFF;
+      uint scale = meta >> 8;
       
-      // Calculate storage size
+      // Initialize decimal_t structure with buffer
+      decimal_digit_t dec_buf[10];  // Sufficient for DECIMAL(65,30)
+      decimal_t decimal_value;
+      decimal_value.len = 10;
+      decimal_value.buf = dec_buf;
+      
+      // Use MySQL's built-in bin2decimal function to parse the packed BCD format
+      int bin_result = bin2decimal(ptr, &decimal_value, precision, scale);
+      
+      // Calculate how many bytes were consumed
       uint intg = precision - scale;
       uint intg_words = intg / 9;
       uint intg_leftover = intg % 9;
@@ -908,17 +928,38 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
       uint frac_leftover = scale % 9;
       
       static const int dig2bytes[] = {0, 1, 1, 2, 2, 3, 3, 4, 4, 4};
-      
       uint bin_size = intg_words * 4 + dig2bytes[intg_leftover] +
                       frac_words * 4 + dig2bytes[frac_leftover];
       
-      // For simplicity, just skip the bytes and return 0
-      // A full implementation would decode the packed BCD format
       ptr += bin_size;
       
-      char buf[64];
-      snprintf(buf, sizeof(buf), "0.%0*d", scale, 0);
-      return std::string(buf);
+      if (bin_result != 0) {
+        time_t now = time(nullptr);
+        struct tm *tm_info = localtime(&now);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+        fprintf(stderr, "[%s] [RAPID Binlog] DEBUG: bin2decimal failed with code %d (precision=%u, scale=%u)\n",
+                timestamp, bin_result, precision, scale);
+        return "NULL";
+      }
+      
+      // Convert decimal to string
+      char str_buf[256];  // Sufficient for any DECIMAL value
+      int str_len = sizeof(str_buf);
+      int result = decimal2string(&decimal_value, str_buf, &str_len, 0, 0);
+      
+      if (result != 0) {
+        time_t now = time(nullptr);
+        struct tm *tm_info = localtime(&now);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+        fprintf(stderr, "[%s] [RAPID Binlog] DEBUG: decimal2string failed with code %d (precision=%u, scale=%u)\n",
+                timestamp, result, precision, scale);
+        return "NULL";
+      }
+      
+      // str_buf now contains a null-terminated string
+      return std::string(str_buf);
     }
     
     case MYSQL_TYPE_BIT: {
@@ -959,27 +1000,38 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
     }
     
     case MYSQL_TYPE_GEOMETRY: {
-      // Geometry stored as WKB (Well-Known Binary)
-      // Length-prefixed like BLOB
-      uint32_t length = 0;
-      if (meta == 1) {
-        length = *ptr++;
-      } else if (meta == 2) {
-        length = read_little_endian<uint16_t>(ptr);
-      } else if (meta == 3) {
-        length = read_little_endian<uint16_t>(ptr);
-        length |= static_cast<uint32_t>(*ptr++) << 16;
-      } else if (meta == 4) {
-        length = read_little_endian<uint32_t>(ptr);
-      }
-      
-      ptr += length;
-      return "NULL";  // Placeholder for geometry
+      // GEOMETRY not supported - should have been filtered in process_table_map
+      time_t now = time(nullptr);
+      struct tm *tm_info = localtime(&now);
+      char timestamp[64];
+      strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+      sql_print_error("[%s] [RAPID Binlog] [ERROR]: Encountered unsupported GEOMETRY column",
+                      timestamp);
+      return "NULL";
     }
     
-    default:
-      // Unknown type - skip and return NULL
+    case MYSQL_TYPE_TYPED_ARRAY:
+    case MYSQL_TYPE_INVALID: {
+      // Unsupported types - should have been caught in process_table_map
+      time_t now_arr = time(nullptr);
+      struct tm *tm_info_arr = localtime(&now_arr);
+      char timestamp_arr[64];
+      strftime(timestamp_arr, sizeof(timestamp_arr), "%Y-%m-%d %H:%M:%S", tm_info_arr);
+      sql_print_error("[%s] [RAPID Binlog] [ERROR]: Encountered unsupported column type %d in binlog",
+                      timestamp_arr, type);
       return "NULL";
+    }
+    
+    default: {
+      // Unknown type - log error and return NULL
+      time_t now_unk = time(nullptr);
+      struct tm *tm_info_unk = localtime(&now_unk);
+      char timestamp_unk[64];
+      strftime(timestamp_unk, sizeof(timestamp_unk), "%Y-%m-%d %H:%M:%S", tm_info_unk);
+      sql_print_error("[%s] [RAPID Binlog] [ERROR]: Unknown column type %d in binlog",
+                      timestamp_unk, type);
+      return "NULL";
+    }
   }
 }
 
@@ -1237,13 +1289,23 @@ void process_table_map(Table_map_log_event *event) {
     ColumnMetadata col;
     col.type = base_event->m_coltype[i];
     
+    // Validate column type is supported
+    if (col.type == MYSQL_TYPE_GEOMETRY || col.type == MYSQL_TYPE_TYPED_ARRAY || col.type == MYSQL_TYPE_INVALID) {
+      time_t now = time(nullptr);
+      struct tm *tm_info = localtime(&now);
+      char timestamp[64];
+      strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+      sql_print_error("[%s] [RAPID Binlog] [ERROR]: Table %s.%s contains unsupported column type %d, skipping replication",
+                      timestamp, db_name, table_name, col.type);
+      return;  // Skip this table
+    }
+    
     // Extract metadata based on type
     // Different types have different metadata sizes
     switch (col.type) {
       case MYSQL_TYPE_FLOAT:
       case MYSQL_TYPE_DOUBLE:
       case MYSQL_TYPE_BLOB:
-      case MYSQL_TYPE_GEOMETRY:
       case MYSQL_TYPE_JSON:
         col.meta = *meta_ptr++;
         break;
@@ -1639,14 +1701,20 @@ static void ensure_binlog_consumer_started() {
     return;
   }
   
+  if (!binlog_consumer_enabled) {
+    LogErr(INFORMATION_LEVEL, ER_SECONDARY_ENGINE_PLUGIN,
+           "RAPID Binlog Consumer: Disabled via rapid_binlog_enabled");
+    return;
+  }
   
   consumer_running.store(true);
   
   try {
     reader_thread = new std::thread(binlog_reader_thread_func);
     consumer_initialized.store(true);
+    LogErr(INFORMATION_LEVEL, ER_SECONDARY_ENGINE_PLUGIN,
+           "RAPID Binlog Consumer: Started");
   } catch (const std::exception &e) {
-    fprintf(stderr, "[RAPID] Binlog: ERROR - Failed to start reader thread: %s\n", e.what());
     LogErr(ERROR_LEVEL, ER_SECONDARY_ENGINE_PLUGIN,
            ("RAPID Binlog Consumer: Failed to start reader thread: " + 
             std::string(e.what())).c_str());
@@ -1666,7 +1734,7 @@ static int plugin_deinit(MYSQL_PLUGIN plugin_info [[maybe_unused]]) {
     consumer_running.store(false);
     reader_cv.notify_all();
     
-    // Wait for reader thread
+    // Wait for reader thread to fully stop before proceeding
     if (reader_thread != nullptr) {
       if (reader_thread->joinable()) {
         reader_thread->join();
@@ -1688,7 +1756,9 @@ static int plugin_deinit(MYSQL_PLUGIN plugin_info [[maybe_unused]]) {
               " pending changes before shutdown").c_str());
       flush_change_queue();
     }
-  } else {
+    
+    // Reset initialization flag AFTER thread is fully stopped
+    consumer_initialized.store(false);
   }
   
   // Cleanup
