@@ -753,14 +753,51 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
       return std::string(buf);
     }
     
-    case MYSQL_TYPE_TIMESTAMP2:
-    case MYSQL_TYPE_DATETIME2: {
-      // New format (5.6+): 5 bytes + fractional seconds
-      // Fractional seconds precision stored in meta
+    case MYSQL_TYPE_TIMESTAMP2: {
+      // TIMESTAMP2: 4 bytes (seconds since epoch) + fractional seconds
+      // Fractional seconds precision (0-6) stored in meta
       uint fsp = meta; // 0-6
       uint fsp_bytes = (fsp + 1) / 2;
       
-      // Read 5 bytes for main datetime value
+      // Read 4 bytes big-endian for timestamp value
+      uint32_t timestamp = (static_cast<uint32_t>(ptr[0]) << 24) |
+                           (static_cast<uint32_t>(ptr[1]) << 16) |
+                           (static_cast<uint32_t>(ptr[2]) << 8) |
+                           static_cast<uint32_t>(ptr[3]);
+      ptr += 4;
+      
+      // Read fractional seconds if present
+      uint32_t frac = 0;
+      for (uint i = 0; i < fsp_bytes; i++) {
+        frac = (frac << 8) | *ptr++;
+      }
+      
+      // Convert timestamp to datetime
+      time_t ts = timestamp;
+      struct tm tm_val;
+      gmtime_r(&ts, &tm_val);
+      
+      char buf[64];
+      if (fsp > 0) {
+        snprintf(buf, sizeof(buf), "'%04d-%02d-%02d %02d:%02d:%02d.%0*u'",
+                 tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
+                 tm_val.tm_hour, tm_val.tm_min, tm_val.tm_sec, fsp, frac);
+      } else {
+        snprintf(buf, sizeof(buf), "'%04d-%02d-%02d %02d:%02d:%02d'",
+                 tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
+                 tm_val.tm_hour, tm_val.tm_min, tm_val.tm_sec);
+      }
+      return std::string(buf);
+    }
+    
+    case MYSQL_TYPE_DATETIME2: {
+      // New format (5.6+): 5 bytes big-endian + fractional seconds
+      // Format: 1 bit sign + 17 bits year*13+month + 5 bits day + 5 bits hour + 6 bits minute + 6 bits second
+      // Fractional seconds precision (0-6) stored in meta
+      uint fsp = meta; // 0-6
+      uint fsp_bytes = (fsp + 1) / 2;
+      
+      // Read 5 bytes as big-endian 40-bit integer
       uint64_t datetime_val = (static_cast<uint64_t>(ptr[0]) << 32) |
                               (static_cast<uint64_t>(ptr[1]) << 24) |
                               (static_cast<uint64_t>(ptr[2]) << 16) |
@@ -768,18 +805,21 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
                               static_cast<uint64_t>(ptr[4]);
       ptr += 5;
       
-      // Decode datetime
-      uint64_t ymd = datetime_val >> 17;
-      uint64_t ym = ymd >> 5;
-      uint64_t hms = datetime_val & 0x1FFFF;
+      // Decode: datetime_val has 40 bits total
+      // High 1 bit is sign (always 1 for valid dates)
+      // Next 17 bits: year_month = year * 13 + month  
+      // Next 5 bits: day (1-31)
+      // Next 5 bits: hour (0-23) 
+      // Next 6 bits: minute (0-59)
+      // Next 6 bits: second (0-59)
       
-      uint day = ymd & 0x1F;
-      uint month = ym & 0x0F;
-      uint year = ym >> 4;
-      
-      uint second = hms & 0x3F;
-      uint minute = (hms >> 6) & 0x3F;
-      uint hour = (hms >> 12);
+      uint64_t year_month = (datetime_val >> 22) & 0x1FFFF;  // 17 bits
+      uint year = year_month / 13;
+      uint month = year_month % 13;
+      uint day = (datetime_val >> 17) & 0x1F;  // 5 bits
+      uint hour = (datetime_val >> 12) & 0x1F;  // 5 bits
+      uint minute = (datetime_val >> 6) & 0x3F;  // 6 bits
+      uint second = datetime_val & 0x3F;  // 6 bits
       
       // Read fractional seconds if present
       uint32_t frac = 0;
