@@ -1,0 +1,66 @@
+--disable_query_log
+eval INSTALL PLUGIN rapid SONAME '$RAPID_PLUGIN';
+--enable_query_log
+
+--echo #
+--echo # Test RAPID with date and time types
+--echo #
+
+CREATE TABLE t_datetime (
+  id INT PRIMARY KEY,
+  col_date DATE,
+  col_time TIME,
+  col_datetime DATETIME,
+  col_timestamp TIMESTAMP
+) SECONDARY_ENGINE RAPID;
+
+--echo # Insert test data before loading
+INSERT INTO t_datetime VALUES (1, '2024-01-15', '14:30:00', '2024-01-15 14:30:00', '2024-01-15 14:30:00');
+INSERT INTO t_datetime VALUES (2, '2000-12-31', '23:59:59', '2000-12-31 23:59:59', '2024-01-01 00:00:00');
+INSERT INTO t_datetime VALUES (3, '1000-01-01', '00:00:00', '1000-01-01 00:00:00', '2024-12-31 12:00:00');
+
+ALTER TABLE t_datetime SECONDARY_LOAD;
+
+--echo # Insert more data via binlog replication
+INSERT INTO t_datetime VALUES (4, '2025-06-15', '09:15:30', '2025-06-15 09:15:30', '2025-06-15 09:15:30');
+
+--echo # Wait for binlog replication
+--sleep 2
+
+SET SESSION secondary_engine_cost_threshold = 0;
+
+--echo # Query all data
+SELECT * FROM t_datetime ORDER BY id;
+
+--echo # Test COUNT
+SELECT COUNT(*) FROM t_datetime;
+
+--echo # Test WHERE with DATE
+SELECT id, col_date FROM t_datetime WHERE col_date > '2024-01-01' ORDER BY id;
+
+--echo # Test WHERE with TIME
+SELECT id, col_time FROM t_datetime WHERE col_time > '12:00:00' ORDER BY id;
+
+--echo # Test WHERE with DATETIME
+SELECT id, col_datetime FROM t_datetime WHERE col_datetime >= '2024-01-01 00:00:00' ORDER BY id;
+
+--echo # Test MIN/MAX with DATE
+SELECT MIN(col_date), MAX(col_date) FROM t_datetime;
+
+--echo # Test MIN/MAX with DATETIME
+SELECT MIN(col_datetime), MAX(col_datetime) FROM t_datetime;
+
+--echo # Test aggregates with multiple date types
+SELECT COUNT(*), MIN(col_date), MAX(col_time) FROM t_datetime;
+
+--echo # Test NULL handling
+INSERT INTO t_datetime (id) VALUES (5);
+--sleep 2
+SELECT id, col_date, col_time, col_datetime FROM t_datetime WHERE id = 5;
+
+ALTER TABLE t_datetime SECONDARY_UNLOAD;
+DROP TABLE t_datetime;
+
+--disable_query_log
+UNINSTALL PLUGIN rapid;
+--enable_query_log
