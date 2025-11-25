@@ -62,6 +62,7 @@
 #include "sql/table.h"
 #include "sql/log.h"  // sql_print_error, sql_print_warning
 #include "decimal.h"  // bin2decimal, decimal2string
+#include "my_time.h"  // my_time_packed_from_binary, my_datetime_packed_from_binary
 
 // Forward declare external DuckDB database handle
 namespace rapid {
@@ -520,6 +521,7 @@ bool apply_changes_to_duckdb(std::vector<ChangeRecord> &changes) {
         LogErr(ERROR_LEVEL, ER_SECONDARY_ENGINE_PLUGIN,
                ("RAPID Binlog: Bulk INSERT of " + std::to_string(end - i) + 
                 " rows failed. Error: " + (error ? std::string(error) : "unknown")).c_str());
+        fprintf(stderr, "[RAPID Binlog] ERROR: Failed SQL: %s\n", sql.c_str());
         error_count += (end - i);
       } else {
         success_count += (end - i);
@@ -699,38 +701,57 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
     }
     
     case MYSQL_TYPE_TIME2: {
-      // New TIME format (5.6+): 3 bytes + fractional seconds
-      // Fractional seconds precision stored in meta
-      uint fsp = meta; // 0-6
+      // Manual parsing of TIME2 format
+      // Format: 3 bytes (big-endian, sign-inverted) + fractional seconds
+      uint fsp = meta;
       uint fsp_bytes = (fsp + 1) / 2;
       
-      // Read 3 bytes for main time value
-      uint32_t time_val = (static_cast<uint32_t>(ptr[0]) << 16) |
-                          (static_cast<uint32_t>(ptr[1]) << 8) |
-                          static_cast<uint32_t>(ptr[2]);
+      // Read 3 bytes as big-endian, XOR with sign bit
+      uint32_t time_val = ((uint32_t)ptr[0] << 16) | ((uint32_t)ptr[1] << 8) | ptr[2];
       ptr += 3;
       
-      // Check sign bit
+      // Check if negative (sign bit was 0 before XOR)
       bool negative = (time_val & 0x800000) == 0;
-      time_val ^= 0x800000; // Remove sign bit
+      time_val ^= 0x800000;  // Remove sign bit
       
-      uint hours = (time_val >> 12);
-      uint minutes = ((time_val >> 6) & 0x3F);
-      uint seconds = (time_val & 0x3F);
+      // Extract time components
+      uint hour = (time_val >> 12);
+      uint minute = (time_val >> 6) & 0x3F;
+      uint second = time_val & 0x3F;
       
-      // Read fractional seconds if present
-      uint32_t frac = 0;
-      for (uint i = 0; i < fsp_bytes; i++) {
-        frac = (frac << 8) | *ptr++;
+      // Read fractional seconds
+      uint64_t frac_raw = 0;
+      if (fsp > 0) {
+        for (uint i = 0; i < fsp_bytes; i++) {
+          frac_raw = (frac_raw << 8) | *ptr++;
+        }
       }
       
+      // Format to string
       char buf[64];
       if (fsp > 0) {
-        snprintf(buf, sizeof(buf), "'%s%02u:%02u:%02u.%0*u'",
-                 negative ? "-" : "", hours, minutes, seconds, fsp, frac);
+        // Scale fractional part to microseconds
+        // The fractional bytes are stored in big-endian and represent
+        // the fractional part scaled to use the available byte range
+        uint64_t frac_usec;
+        switch (fsp) {
+          case 1: frac_usec = (frac_raw / 10) * 100000; break;       // 1 byte: value/10 gives deciseconds
+          case 2: frac_usec = (frac_raw / 100) * 10000; break;       // 1 byte: value/100 gives centiseconds
+          case 3: frac_usec = (frac_raw / 10) * 1000; break;         // 2 bytes: value/10 gives milliseconds
+          case 4: frac_usec = (frac_raw / 100) * 100; break;         // 2 bytes: value/100 gives 0.1ms
+          case 5: frac_usec = (frac_raw / 100) * 10; break;          // 3 bytes: value/100 gives 10µs
+          case 6: frac_usec = frac_raw; break;                       // 3 bytes: value is already in µs
+          default: frac_usec = 0; break;
+        }
+        // Truncate to precision
+        uint64_t divisor = 1;
+        for (uint i = 0; i < (6 - fsp); i++) divisor *= 10;
+        uint64_t frac_display = frac_usec / divisor;
+        snprintf(buf, sizeof(buf), "'%s%02u:%02u:%02u.%0*lu'",
+                 negative ? "-" : "", hour, minute, second, (int)fsp, (unsigned long)frac_display);
       } else {
         snprintf(buf, sizeof(buf), "'%s%02u:%02u:%02u'",
-                 negative ? "-" : "", hours, minutes, seconds);
+                 negative ? "-" : "", hour, minute, second);
       }
       return std::string(buf);
     }
@@ -754,34 +775,52 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
     }
     
     case MYSQL_TYPE_TIMESTAMP2: {
-      // TIMESTAMP2: 4 bytes (seconds since epoch) + fractional seconds
-      // Fractional seconds precision (0-6) stored in meta
-      uint fsp = meta; // 0-6
+      // Manual parsing of TIMESTAMP2 format
+      // Format: 4 bytes (big-endian Unix timestamp) + fractional seconds
+      uint fsp = meta;
       uint fsp_bytes = (fsp + 1) / 2;
       
-      // Read 4 bytes big-endian for timestamp value
-      uint32_t timestamp = (static_cast<uint32_t>(ptr[0]) << 24) |
-                           (static_cast<uint32_t>(ptr[1]) << 16) |
-                           (static_cast<uint32_t>(ptr[2]) << 8) |
-                           static_cast<uint32_t>(ptr[3]);
+      // Read 4 bytes as big-endian Unix timestamp
+      uint32_t timestamp = ((uint32_t)ptr[0] << 24) | ((uint32_t)ptr[1] << 16) |
+                           ((uint32_t)ptr[2] << 8) | ptr[3];
       ptr += 4;
       
-      // Read fractional seconds if present
-      uint32_t frac = 0;
-      for (uint i = 0; i < fsp_bytes; i++) {
-        frac = (frac << 8) | *ptr++;
+      // Read fractional seconds
+      uint64_t frac_raw = 0;
+      if (fsp > 0) {
+        for (uint i = 0; i < fsp_bytes; i++) {
+          frac_raw = (frac_raw << 8) | *ptr++;
+        }
       }
       
-      // Convert timestamp to datetime
+      // Convert Unix timestamp to datetime (UTC)
       time_t ts = timestamp;
       struct tm tm_val;
       gmtime_r(&ts, &tm_val);
       
+      // Format to string
       char buf[64];
       if (fsp > 0) {
-        snprintf(buf, sizeof(buf), "'%04d-%02d-%02d %02d:%02d:%02d.%0*u'",
+        // Scale fractional part to microseconds
+        // The fractional bytes are stored in big-endian and represent
+        // the fractional part scaled to use the available byte range
+        uint64_t frac_usec;
+        switch (fsp) {
+          case 1: frac_usec = (frac_raw / 10) * 100000; break;       // 1 byte: value/10 gives deciseconds
+          case 2: frac_usec = (frac_raw / 100) * 10000; break;       // 1 byte: value/100 gives centiseconds
+          case 3: frac_usec = (frac_raw / 10) * 1000; break;         // 2 bytes: value/10 gives milliseconds
+          case 4: frac_usec = (frac_raw / 100) * 100; break;         // 2 bytes: value/100 gives 0.1ms
+          case 5: frac_usec = (frac_raw / 100) * 10; break;          // 3 bytes: value/100 gives 10µs
+          case 6: frac_usec = frac_raw; break;                       // 3 bytes: value is already in µs
+          default: frac_usec = 0; break;
+        }
+        // Truncate to precision
+        uint64_t divisor = 1;
+        for (uint i = 0; i < (6 - fsp); i++) divisor *= 10;
+        uint64_t frac_display = frac_usec / divisor;
+        snprintf(buf, sizeof(buf), "'%04d-%02d-%02d %02d:%02d:%02d.%0*lu'",
                  tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
-                 tm_val.tm_hour, tm_val.tm_min, tm_val.tm_sec, fsp, frac);
+                 tm_val.tm_hour, tm_val.tm_min, tm_val.tm_sec, (int)fsp, (unsigned long)frac_display);
       } else {
         snprintf(buf, sizeof(buf), "'%04d-%02d-%02d %02d:%02d:%02d'",
                  tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
@@ -791,46 +830,65 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
     }
     
     case MYSQL_TYPE_DATETIME2: {
-      // New format (5.6+): 5 bytes big-endian + fractional seconds
-      // Format: 1 bit sign + 17 bits year*13+month + 5 bits day + 5 bits hour + 6 bits minute + 6 bits second
-      // Fractional seconds precision (0-6) stored in meta
-      uint fsp = meta; // 0-6
+      // Manual parsing of DATETIME2 format
+      // Format: 5 bytes (big-endian, packed) + fractional seconds
+      uint fsp = meta;
       uint fsp_bytes = (fsp + 1) / 2;
       
-      // Read 5 bytes as big-endian 40-bit integer
-      uint64_t datetime_val = (static_cast<uint64_t>(ptr[0]) << 32) |
-                              (static_cast<uint64_t>(ptr[1]) << 24) |
-                              (static_cast<uint64_t>(ptr[2]) << 16) |
-                              (static_cast<uint64_t>(ptr[3]) << 8) |
-                              static_cast<uint64_t>(ptr[4]);
+      // Read 5 bytes as big-endian 40-bit value
+      uint64_t datetime_val = ((uint64_t)ptr[0] << 32) | ((uint64_t)ptr[1] << 24) |
+                              ((uint64_t)ptr[2] << 16) | ((uint64_t)ptr[3] << 8) | ptr[4];
       ptr += 5;
       
-      // Decode: datetime_val has 40 bits total
-      // High 1 bit is sign (always 1 for valid dates)
-      // Next 17 bits: year_month = year * 13 + month  
-      // Next 5 bits: day (1-31)
-      // Next 5 bits: hour (0-23) 
-      // Next 6 bits: minute (0-59)
-      // Next 6 bits: second (0-59)
+      // The value is stored with a sign bit, XOR it
+      datetime_val ^= 0x8000000000ULL;
       
-      uint64_t year_month = (datetime_val >> 22) & 0x1FFFF;  // 17 bits
+      // Extract datetime components from 40 bits:
+      // 1 bit: sign (not used for valid dates)
+      // 17 bits: year*13 + month (year can be 0-9999, month 0-12)
+      // 5 bits: day (1-31)
+      // 5 bits: hour (0-23)
+      // 6 bits: minute (0-59)
+      // 6 bits: second (0-59)
+      
+      uint64_t year_month = (datetime_val >> 22) & 0x1FFFF;
       uint year = year_month / 13;
       uint month = year_month % 13;
-      uint day = (datetime_val >> 17) & 0x1F;  // 5 bits
-      uint hour = (datetime_val >> 12) & 0x1F;  // 5 bits
-      uint minute = (datetime_val >> 6) & 0x3F;  // 6 bits
-      uint second = datetime_val & 0x3F;  // 6 bits
+      uint day = (datetime_val >> 17) & 0x1F;
+      uint hour = (datetime_val >> 12) & 0x1F;
+      uint minute = (datetime_val >> 6) & 0x3F;
+      uint second = datetime_val & 0x3F;
       
-      // Read fractional seconds if present
-      uint32_t frac = 0;
-      for (uint i = 0; i < fsp_bytes; i++) {
-        frac = (frac << 8) | *ptr++;
+      // Read fractional seconds
+      uint64_t frac_raw = 0;
+      if (fsp > 0) {
+        for (uint i = 0; i < fsp_bytes; i++) {
+          frac_raw = (frac_raw << 8) | *ptr++;
+        }
       }
       
+      // Format to string
       char buf[64];
       if (fsp > 0) {
-        snprintf(buf, sizeof(buf), "'%04u-%02u-%02u %02u:%02u:%02u.%0*u'",
-                 year, month, day, hour, minute, second, fsp, frac);
+        // Scale fractional part to microseconds
+        // The fractional bytes are stored in big-endian and represent
+        // the fractional part scaled to use the available byte range
+        uint64_t frac_usec;
+        switch (fsp) {
+          case 1: frac_usec = (frac_raw / 10) * 100000; break;       // 1 byte: value/10 gives deciseconds
+          case 2: frac_usec = (frac_raw / 100) * 10000; break;       // 1 byte: value/100 gives centiseconds
+          case 3: frac_usec = (frac_raw / 10) * 1000; break;         // 2 bytes: value/10 gives milliseconds
+          case 4: frac_usec = (frac_raw / 100) * 100; break;         // 2 bytes: value/100 gives 0.1ms
+          case 5: frac_usec = (frac_raw / 100) * 10; break;          // 3 bytes: value/100 gives 10µs
+          case 6: frac_usec = frac_raw; break;                       // 3 bytes: value is already in µs
+          default: frac_usec = 0; break;
+        }
+        // Truncate to precision
+        uint64_t divisor = 1;
+        for (uint i = 0; i < (6 - fsp); i++) divisor *= 10;
+        uint64_t frac_display = frac_usec / divisor;
+        snprintf(buf, sizeof(buf), "'%04u-%02u-%02u %02u:%02u:%02u.%0*lu'",
+                 year, month, day, hour, minute, second, (int)fsp, (unsigned long)frac_display);
       } else {
         snprintf(buf, sizeof(buf), "'%04u-%02u-%02u %02u:%02u:%02u'",
                  year, month, day, hour, minute, second);
@@ -1126,6 +1184,7 @@ const uchar* parse_binlog_row(const TableMapInfo &table_info, const uchar *row_d
     bool is_null = (null_byte < null_byte_count) && (null_bits[null_byte] & (1 << null_bit));
     
     // Parse the field value (this advances field_data pointer)
+    // Parse the field value (this advances field_data pointer)
     std::string value = parse_field_value(field_data, col_meta.type, col_meta.meta, is_null);
     
     columns.push_back({col_meta.name, value});
@@ -1350,14 +1409,19 @@ void process_table_map(Table_map_log_event *event) {
         col.meta = *meta_ptr++;
         break;
       
+      case MYSQL_TYPE_TIME2:
+      case MYSQL_TYPE_DATETIME2:
+      case MYSQL_TYPE_TIMESTAMP2:
+        // 1 byte of metadata (fractional seconds precision 0-6)
+        col.meta = meta_ptr[0];
+        meta_ptr += 1;
+        break;
+      
       case MYSQL_TYPE_BIT:
       case MYSQL_TYPE_VARCHAR:
       case MYSQL_TYPE_NEWDECIMAL:
       case MYSQL_TYPE_VAR_STRING:
       case MYSQL_TYPE_STRING:
-      case MYSQL_TYPE_TIME2:
-      case MYSQL_TYPE_DATETIME2:
-      case MYSQL_TYPE_TIMESTAMP2:
         // 2 bytes of metadata
         col.meta = meta_ptr[0] | (meta_ptr[1] << 8);
         meta_ptr += 2;
