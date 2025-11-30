@@ -1,5 +1,5 @@
 --disable_query_log
-eval INSTALL PLUGIN rapid SONAME '$RAPID_PLUGIN';
+eval INSTALL PLUGIN rapid SONAME 'ha_rapid.so';
 --enable_query_log
 
 --echo #

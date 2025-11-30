@@ -417,6 +417,31 @@ int ha_rapid::create_duckdb_table(const TABLE &table_arg, duckdb_connection con)
     create_table_query += "\n";
     
   }
+
+  // Detect primary key columns
+  std::vector<std::string> pk_columns;
+  if (table_arg.s->primary_key != MAX_KEY) {
+    // Table has a primary key
+    KEY *pk_info = &table_arg.s->key_info[table_arg.s->primary_key];
+    for (uint i = 0; i < pk_info->user_defined_key_parts; i++) {
+      KEY_PART_INFO *key_part = &pk_info->key_part[i];
+      if (key_part->field) {
+        pk_columns.push_back(std::string(key_part->field->field_name));
+      }
+    }
+  }
+
+  // Add PRIMARY KEY constraint if we have primary key columns
+  std::string pk_constraint = "";
+  if (!pk_columns.empty()) {
+    pk_constraint = ",\nPRIMARY KEY (";
+    for (size_t i = 0; i < pk_columns.size(); i++) {
+      if (i > 0) pk_constraint += ", ";
+      pk_constraint += pk_columns[i];
+    }
+    pk_constraint += ")";
+  }
+
   std::string drop_table_query = "DROP TABLE IF EXISTS " +
                                  std::string(table_arg.s->db.str) + "_" +
                                  std::string(table_arg.s->table_name.str);
@@ -424,7 +449,7 @@ int ha_rapid::create_duckdb_table(const TABLE &table_arg, duckdb_connection con)
   create_table_query = "CREATE TABLE " +
                         std::string(table_arg.s->db.str) + "_" +
                         std::string(table_arg.s->table_name.str) +
-                        "\n(\n" + create_table_query + "\n)\n";
+                        "\n(\n" + create_table_query + pk_constraint + "\n)\n";
                         
   if (duckdb_query(con, drop_table_query.c_str(), nullptr) == DuckDBError) {
     // handle error

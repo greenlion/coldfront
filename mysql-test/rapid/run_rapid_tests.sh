@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_MYSQL_TEST_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Build directory where mtr and plugins are located
-BUILD_DIR="${BUILD_DIR:-/home/justin/mysql/8.4}"
+BUILD_DIR="${BUILD_DIR:-/home/ubuntu/mysql/8.4}"
 MTR="${BUILD_DIR}/mysql-test/mtr"
 PLUGIN_DIR="${PLUGIN_DIR:-${BUILD_DIR}/lib/plugin}"
 BUILD_SUITE_DIR="${BUILD_DIR}/mysql-test/suite"
