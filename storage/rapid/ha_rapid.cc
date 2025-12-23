@@ -1887,6 +1887,8 @@ static int Init(MYSQL_PLUGIN p) {
     // Enable automatic installation and loading of known extensions
     duckdb_query(init_con, "SET autoinstall_known_extensions=1", nullptr);
     duckdb_query(init_con, "SET autoload_known_extensions=1", nullptr);
+    std::string sql = "ATTACH '" + std::string(db_path) + "' (COMPRESS true)";
+    duckdb_query(init_con, sql.c_str(), nullptr); 
     
     duckdb_disconnect(&init_con);
   }
