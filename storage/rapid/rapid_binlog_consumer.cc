@@ -256,7 +256,7 @@ std::vector<std::string> get_column_names_from_duckdb(
     duckdb_connection conn) {
   
   std::string key = db_name + "." + table_name;
-  
+
   // Check cache first
   {
     std::lock_guard<std::mutex> lock(column_names_mutex);
@@ -265,10 +265,9 @@ std::vector<std::string> get_column_names_from_duckdb(
       return it->second;
     }
   }
-  
+
   // Query table schema using LIMIT 0 (no data, just metadata)
-  std::string duckdb_table = db_name + "_" + table_name;
-  std::string query = "SELECT * FROM " + duckdb_table + " LIMIT 0";
+  std::string query = "SELECT * FROM " + db_name + "." + table_name + " LIMIT 0";
   
   duckdb_result result;
   duckdb_state state = duckdb_query(conn, query.c_str(), &result);
@@ -324,7 +323,7 @@ std::string field_to_sql_value(Field *field) {
 */
 std::string generate_insert_sql(const ChangeRecord &change) {
   std::ostringstream sql;
-  sql << "INSERT INTO " << change.db_name << "_" << change.table_name << " VALUES (";
+  sql << "INSERT INTO " << change.db_name << "." << change.table_name << " VALUES (";
   
   bool first = true;
   for (const auto &col : change.columns) {
@@ -344,7 +343,7 @@ std::string generate_insert_sql(const ChangeRecord &change) {
 */
 std::string generate_update_sql(const ChangeRecord &change, duckdb_connection conn) {
   std::ostringstream sql;
-  sql << "UPDATE " << change.db_name << "_" << change.table_name << " SET ";
+  sql << "UPDATE " << change.db_name << "." << change.table_name << " SET ";
   
   // Get real column names from DuckDB
   std::vector<std::string> column_names = 
@@ -386,7 +385,7 @@ std::string generate_update_sql(const ChangeRecord &change, duckdb_connection co
 */
 std::string generate_delete_sql(const ChangeRecord &change, duckdb_connection conn) {
   std::ostringstream sql;
-  sql << "DELETE FROM " << change.db_name << "_" << change.table_name << " WHERE ";
+  sql << "DELETE FROM " << change.db_name << "." << change.table_name << " WHERE ";
   
   // Get real column names from DuckDB
   std::vector<std::string> column_names = 
