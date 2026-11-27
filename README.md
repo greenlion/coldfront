@@ -1,3 +1,4 @@
+👋I am looking for a long-term partner.  🌍I was previously working in Japan as a software engineer and AI trainer, but I have recently lost my position—a situation that would be too lengthy to explain in detail here.  Moving forward, I intend to pursue global-facing roles and continue with AI training.  ✅✅As you may know, budgets in Japan are quite limited; even if one secures a position with a global company, the expected monthly compensation is typically only around $2,000–$3,000.  Furthermor
 # coldfront
 Plugins and components for a MySQL Heatwave-like secondary engine duckdb implementation.  Tested in the 8.4 branch of [https://github.com/mysql/mysql-server:8.4](https://github.com/mysql/mysql-server/tree/8.4)
 
